@@ -50,6 +50,11 @@ impl<'a> Cursor<'a> {
         Ok(i16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
+    pub(crate) fn read_i32(&mut self) -> Result<i32> {
+        let bytes = self.read_bytes(4)?;
+        Ok(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
     pub(crate) fn read_i64(&mut self) -> Result<i64> {
         let bytes = self.read_bytes(8)?;
         Ok(i64::from_be_bytes([

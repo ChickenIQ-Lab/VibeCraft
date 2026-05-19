@@ -1,7 +1,8 @@
 use super::packets::keep_alive_packet;
 use super::state::{
-    interact_with_block, place_hand_block, swap_held_with_offhand, update_held_slot,
-    update_inventory_slot, update_player_state,
+    break_world_block, interact_with_block, pick_block, place_hand_block, set_player_game_mode,
+    swap_held_with_offhand, update_held_slot, update_inventory_slot, update_inventory_slots,
+    update_player_state,
 };
 use crate::constants::*;
 use crate::cursor::Cursor;
@@ -55,6 +56,19 @@ async fn handle_play_packet(
 ) -> Result<()> {
     // Only packets that change this toy world are decoded; the rest are ignored.
     match cursor_packet_id {
+        SERVERBOUND_CHANGE_GAME_MODE_PACKET_ID => {
+            if let Some(game_mode) = crate::types::GameMode::from_id(cursor.read_var_i32()?) {
+                set_player_game_mode(uuid, game_mode).await?;
+            }
+        }
+        SERVERBOUND_CHAT_COMMAND_PACKET_ID | SERVERBOUND_CHAT_COMMAND_SIGNED_PACKET_ID => {
+            let command = cursor.read_string()?;
+            super::commands::handle_command(uuid, &command).await?;
+        }
+        SERVERBOUND_CONTAINER_CLICK_PACKET_ID => {
+            let changed_slots = read_container_click_changed_slots(cursor)?;
+            update_inventory_slots(uuid, changed_slots).await?;
+        }
         SERVERBOUND_SET_CARRIED_ITEM_PACKET_ID => {
             update_held_slot(uuid, cursor.read_i16()?).await?
         }
@@ -79,11 +93,17 @@ async fn handle_play_packet(
             let _direction = cursor.read_u8()?;
             let _sequence = cursor.read_var_i32()?;
             match action {
-                0 | 2 => super::state::set_world_block(pos, 0).await?,
+                0 => break_world_block(uuid, pos, true).await?,
+                2 => break_world_block(uuid, pos, false).await?,
                 // This action swaps the selected hotbar slot with the offhand slot.
                 6 => swap_held_with_offhand(uuid).await?,
                 _ => {}
             }
+        }
+        SERVERBOUND_PICK_ITEM_FROM_BLOCK_PACKET_ID => {
+            let pos = cursor.read_block_pos()?;
+            let _include_data = cursor.read_bool()?;
+            pick_block(uuid, pos).await?;
         }
         SERVERBOUND_USE_ITEM_ON_PACKET_ID => {
             let hand = cursor.read_var_i32()?;
@@ -160,4 +180,56 @@ fn direction_offset(direction: i32) -> (i32, i32, i32) {
         5 => (1, 0, 0),
         _ => (0, 1, 0),
     }
+}
+
+fn read_container_click_changed_slots(
+    cursor: &mut Cursor<'_>,
+) -> Result<Vec<(i16, Option<PersistedInventoryItem>)>> {
+    let _container_id = cursor.read_var_i32()?;
+    let _state_id = cursor.read_var_i32()?;
+    let _slot_num = cursor.read_i16()?;
+    let _button_num = cursor.read_u8()?;
+    let _container_input = cursor.read_var_i32()?;
+
+    let slot_count = cursor.read_var_i32()?;
+    let mut changed_slots = Vec::new();
+    for _ in 0..slot_count.clamp(0, 128) {
+        let slot = cursor.read_i16()?;
+        changed_slots.push((slot, read_hashed_stack(cursor)?));
+    }
+    let _carried_item = read_hashed_stack(cursor)?;
+    Ok(changed_slots)
+}
+
+fn read_hashed_stack(cursor: &mut Cursor<'_>) -> Result<Option<PersistedInventoryItem>> {
+    if !cursor.read_bool()? {
+        return Ok(None);
+    }
+
+    let item_id = cursor.read_var_i32()?;
+    let count = cursor.read_var_i32()?;
+    skip_hashed_components(cursor)?;
+    if count <= 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(PersistedInventoryItem {
+        item_id,
+        count,
+        encoded: Vec::new(),
+    }))
+}
+
+fn skip_hashed_components(cursor: &mut Cursor<'_>) -> Result<()> {
+    let added_count = cursor.read_var_i32()?;
+    for _ in 0..added_count.clamp(0, 256) {
+        let _component_id = cursor.read_var_i32()?;
+        let _component_hash = cursor.read_i32()?;
+    }
+
+    let removed_count = cursor.read_var_i32()?;
+    for _ in 0..removed_count.clamp(0, 256) {
+        let _component_id = cursor.read_var_i32()?;
+    }
+    Ok(())
 }

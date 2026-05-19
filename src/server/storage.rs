@@ -18,8 +18,37 @@ static PLAYER_SAVE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static WORLD_SAVE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 // Persisted files start with a short magic string so bad files fail loudly.
-const PLAYER_SAVE_MAGIC: &[u8; 8] = b"VCPPLYR1";
+const PLAYER_SAVE_MAGIC: &[u8; 8] = b"VCPPLYR2";
+const LEGACY_PLAYER_SAVE_MAGIC: &[u8; 8] = b"VCPPLYR1";
 const WORLD_SAVE_MAGIC: &[u8; 8] = b"VCPWRLD1";
+
+#[derive(serde::Deserialize)]
+struct LegacyPersistedPlayerData {
+    x: f64,
+    y: f64,
+    z: f64,
+    y_rot: f32,
+    x_rot: f32,
+    on_ground: bool,
+    held_slot: i16,
+    inventory_slots: Vec<Option<PersistedInventoryItem>>,
+}
+
+impl From<LegacyPersistedPlayerData> for PersistedPlayerData {
+    fn from(data: LegacyPersistedPlayerData) -> Self {
+        Self {
+            x: data.x,
+            y: data.y,
+            z: data.z,
+            y_rot: data.y_rot,
+            x_rot: data.x_rot,
+            on_ground: data.on_ground,
+            held_slot: data.held_slot,
+            inventory_slots: data.inventory_slots,
+            game_mode: Default::default(),
+        }
+    }
+}
 
 #[derive(serde::Deserialize, serde::Serialize)]
 struct PersistedWorldData {
@@ -82,10 +111,18 @@ pub(super) async fn save_online_players() -> Result<()> {
     Ok(())
 }
 
+pub(super) async fn reset_persistent_data() -> Result<()> {
+    let _player_guard = PLAYER_SAVE_LOCK.lock().await;
+    let _world_guard = WORLD_SAVE_LOCK.lock().await;
+
+    remove_dir_if_exists(&data_dir().join("players")).await?;
+    remove_dir_if_exists(&data_dir().join("world")).await
+}
+
 pub(super) async fn load_player_data(uuid: [u8; 16]) -> Result<PersistedPlayerData> {
     let path = player_data_path(uuid);
     let mut data: PersistedPlayerData = match fs::read(&path).await {
-        Ok(bytes) => decode_binary_save(&path, &bytes, PLAYER_SAVE_MAGIC)?,
+        Ok(bytes) => decode_player_save(&path, &bytes)?,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(PersistedPlayerData::default()),
         Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
     };
@@ -106,9 +143,18 @@ pub(super) async fn save_player_data(player: &OnlinePlayer) -> Result<()> {
         on_ground: player.on_ground,
         held_slot: player.held_slot,
         inventory_slots: player.inventory_slots.clone(),
+        game_mode: player.game_mode,
     };
 
     write_binary_atomic(&path, PLAYER_SAVE_MAGIC, &data).await
+}
+
+async fn remove_dir_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
 }
 
 async fn write_binary_atomic<T: Serialize>(path: &Path, magic: &[u8], value: &T) -> Result<()> {
@@ -131,6 +177,20 @@ fn decode_binary_save<T: DeserializeOwned>(path: &Path, bytes: &[u8], magic: &[u
     );
     bincode::deserialize(&bytes[magic.len()..])
         .with_context(|| format!("failed to decode {}", path.display()))
+}
+
+fn decode_player_save(path: &Path, bytes: &[u8]) -> Result<PersistedPlayerData> {
+    if bytes.starts_with(PLAYER_SAVE_MAGIC) {
+        return decode_binary_save(path, bytes, PLAYER_SAVE_MAGIC);
+    }
+    if bytes.starts_with(LEGACY_PLAYER_SAVE_MAGIC) {
+        let legacy: LegacyPersistedPlayerData =
+            decode_binary_save(path, bytes, LEGACY_PLAYER_SAVE_MAGIC)?;
+        return Ok(legacy.into());
+    }
+
+    ensure!(false, "{} has wrong persistence magic", path.display());
+    unreachable!()
 }
 
 async fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {

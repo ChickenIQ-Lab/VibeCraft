@@ -57,6 +57,75 @@ pub(crate) struct OnlinePlayer {
     pub(crate) loaded_chunks: HashSet<(i32, i32)>,
     pub(crate) held_slot: i16,
     pub(crate) inventory_slots: Vec<Option<PersistedInventoryItem>>,
+    pub(crate) game_mode: GameMode,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum GameMode {
+    Survival,
+    Creative,
+    Adventure,
+    Spectator,
+}
+
+impl Default for GameMode {
+    fn default() -> Self {
+        Self::Creative
+    }
+}
+
+impl GameMode {
+    pub(crate) fn id(self) -> i32 {
+        match self {
+            Self::Survival => 0,
+            Self::Creative => 1,
+            Self::Adventure => 2,
+            Self::Spectator => 3,
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Survival => "survival",
+            Self::Creative => "creative",
+            Self::Adventure => "adventure",
+            Self::Spectator => "spectator",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "0" | "s" | "survival" => Some(Self::Survival),
+            "1" | "c" | "creative" => Some(Self::Creative),
+            "2" | "a" | "adventure" => Some(Self::Adventure),
+            "3" | "sp" | "spectator" => Some(Self::Spectator),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn from_id(id: i32) -> Option<Self> {
+        match id {
+            0 => Some(Self::Survival),
+            1 => Some(Self::Creative),
+            2 => Some(Self::Adventure),
+            3 => Some(Self::Spectator),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn allows_building(self) -> bool {
+        matches!(self, Self::Survival | Self::Creative)
+    }
+
+    pub(crate) fn ability_flags(self) -> u8 {
+        match self {
+            // Creative grants invulnerability, flight permission, and instant build.
+            Self::Creative => 0x01 | 0x04 | 0x08,
+            Self::Spectator => 0x01 | 0x02 | 0x04,
+            Self::Survival | Self::Adventure => 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -82,6 +151,8 @@ pub(crate) struct PersistedPlayerData {
     pub(crate) held_slot: i16,
     #[serde(default = "empty_inventory_slots")]
     pub(crate) inventory_slots: Vec<Option<PersistedInventoryItem>>,
+    #[serde(default)]
+    pub(crate) game_mode: GameMode,
 }
 
 impl Default for PersistedPlayerData {
@@ -95,6 +166,7 @@ impl Default for PersistedPlayerData {
             on_ground: true,
             held_slot: 0,
             inventory_slots: empty_inventory_slots(),
+            game_mode: GameMode::default(),
         }
     }
 }

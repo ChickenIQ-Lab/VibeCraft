@@ -1,16 +1,18 @@
 use super::packets::{
     add_player_entity_packet, block_update_packet, chunk_batch_finished_packet,
     chunk_batch_start_packet, chunk_cache_center_packet, container_set_slot_packet,
-    entity_position_sync_packet, player_entity_metadata_packet, player_info_remove_packet,
-    player_info_update_packet, remove_entities_packet, rotate_head_packet,
+    entity_position_sync_packet, game_event_packet, player_abilities_packet,
+    player_entity_metadata_packet, player_game_mode_update_packet, player_info_remove_packet,
+    player_info_update_packet, player_position_packet, remove_entities_packet, rotate_head_packet,
+    set_held_slot_packet, system_chat_packet,
 };
 use super::profile::uuid_without_dashes;
-use super::storage::{save_player_data, save_world_blocks};
-use super::world::flat_chunk_packet;
+use super::storage::{reset_persistent_data, save_player_data, save_world_blocks};
+use super::world::{flat_chunk_packet, generated_block_state_at, initial_chunk_set};
 use crate::constants::*;
 use crate::types::{
-    BLOCK_ITEM_PLACEMENTS, BlockPlacement, BlockPlacementKind, ONLINE_PLAYERS, OnlinePlayer,
-    PersistedInventoryItem, WORLD_BLOCKS,
+    BLOCK_ITEM_PLACEMENTS, BlockPlacement, BlockPlacementKind, GameMode, ONLINE_PLAYERS,
+    OnlinePlayer, PersistedInventoryItem, PersistedPlayerData, WORLD_BLOCKS,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -147,17 +149,136 @@ pub(super) async fn update_held_slot(uuid: [u8; 16], slot: i16) -> Result<()> {
     Ok(())
 }
 
+pub(super) async fn set_player_game_mode(uuid: [u8; 16], game_mode: GameMode) -> Result<()> {
+    let mut online = ONLINE_PLAYERS.lock().await;
+    let Some(index) = online.iter().position(|player| player.uuid == uuid) else {
+        return Ok(());
+    };
+
+    online[index].game_mode = game_mode;
+    let self_sender = online[index].sender.clone();
+    let senders: Vec<_> = online.iter().map(|player| player.sender.clone()).collect();
+    drop(online);
+
+    let _ = self_sender.send(game_event_packet(
+        GAME_EVENT_CHANGE_GAME_MODE,
+        game_mode.id() as f32,
+    ));
+    let _ = self_sender.send(player_abilities_packet(game_mode));
+    let update = player_game_mode_update_packet(uuid, game_mode);
+    for sender in senders {
+        let _ = sender.send(update.clone());
+    }
+    Ok(())
+}
+
+pub(super) async fn send_system_message(uuid: [u8; 16], message: &str) -> Result<()> {
+    let packet = system_chat_packet(message)?;
+    let online = ONLINE_PLAYERS.lock().await;
+    if let Some(player) = online.iter().find(|player| player.uuid == uuid) {
+        let _ = player.sender.send(packet);
+    }
+    Ok(())
+}
+
+pub(super) async fn reset_server_data() -> Result<()> {
+    reset_persistent_data().await?;
+    WORLD_BLOCKS.lock().await.clear();
+
+    let defaults = PersistedPlayerData::default();
+    let chunk_x = (defaults.x.floor() as i32).div_euclid(16);
+    let chunk_z = (defaults.z.floor() as i32).div_euclid(16);
+    let mut online = ONLINE_PLAYERS.lock().await;
+    for player in online.iter_mut() {
+        player.x = defaults.x;
+        player.y = defaults.y;
+        player.z = defaults.z;
+        player.y_rot = defaults.y_rot;
+        player.x_rot = defaults.x_rot;
+        player.on_ground = defaults.on_ground;
+        player.held_slot = defaults.held_slot;
+        player.inventory_slots = defaults.inventory_slots.clone();
+        player.game_mode = defaults.game_mode;
+        player.loaded_chunks = initial_chunk_set(chunk_x, chunk_z);
+    }
+    let players = online.clone();
+    drop(online);
+
+    let mode_updates: Vec<_> = players
+        .iter()
+        .map(|player| player_game_mode_update_packet(player.uuid, defaults.game_mode))
+        .collect();
+    for player in &players {
+        send_reset_player_packets(player, &mode_updates).await;
+    }
+    Ok(())
+}
+
+async fn send_reset_player_packets(player: &OnlinePlayer, mode_updates: &[Vec<u8>]) {
+    let _ = player.sender.send(game_event_packet(
+        GAME_EVENT_CHANGE_GAME_MODE,
+        player.game_mode.id() as f32,
+    ));
+    let _ = player
+        .sender
+        .send(player_abilities_packet(player.game_mode));
+    let _ = player.sender.send(player_position_packet(
+        player.x,
+        player.y,
+        player.z,
+        player.y_rot,
+        player.x_rot,
+    ));
+    let _ = player.sender.send(set_held_slot_packet(player.held_slot));
+    for slot in 1..PLAYER_INVENTORY_SLOT_COUNT {
+        let _ = player
+            .sender
+            .send(container_set_slot_packet(slot as i16, None));
+    }
+    for packet in mode_updates {
+        let _ = player.sender.send(packet.clone());
+    }
+    let _ = player.sender.send(chunk_cache_center_packet(
+        (player.x.floor() as i32).div_euclid(16),
+        (player.z.floor() as i32).div_euclid(16),
+    ));
+    let _ = player.sender.send(chunk_batch_start_packet());
+    let mut sent = 0;
+    for z in -VIEW_DISTANCE..=VIEW_DISTANCE {
+        for x in -VIEW_DISTANCE..=VIEW_DISTANCE {
+            let _ = player.sender.send(flat_chunk_packet(x, z).await);
+            sent += 1;
+        }
+    }
+    let _ = player.sender.send(chunk_batch_finished_packet(sent));
+    if let Ok(packet) = system_chat_packet("Server data reset") {
+        let _ = player.sender.send(packet);
+    }
+}
+
 pub(super) async fn update_inventory_slot(
     uuid: [u8; 16],
     slot: i16,
     item: Option<PersistedInventoryItem>,
 ) -> Result<()> {
+    update_inventory_slots(uuid, vec![(slot, item)]).await
+}
+
+pub(super) async fn update_inventory_slots(
+    uuid: [u8; 16],
+    slots: Vec<(i16, Option<PersistedInventoryItem>)>,
+) -> Result<()> {
     let mut online = ONLINE_PLAYERS.lock().await;
-    if let Some(player) = online.iter_mut().find(|player| player.uuid == uuid)
-        && slot > 0
-        && let Some(saved_slot) = player.inventory_slots.get_mut(slot as usize)
-    {
-        *saved_slot = item;
+    let Some(player) = online.iter_mut().find(|player| player.uuid == uuid) else {
+        return Ok(());
+    };
+
+    for (slot, item) in slots {
+        if slot > 0
+            && let Some(saved_slot) = player.inventory_slots.get_mut(slot as usize)
+        {
+            *saved_slot = item.filter(|item| item.count > 0);
+        }
     }
     Ok(())
 }
@@ -192,6 +313,79 @@ pub(super) async fn swap_held_with_offhand(uuid: [u8; 16]) -> Result<()> {
         offhand_after.as_ref(),
     ));
     Ok(())
+}
+
+pub(super) async fn pick_block(uuid: [u8; 16], pos: (i32, i32, i32)) -> Result<()> {
+    let state_id = block_state_at(pos).await;
+    let Some(item_id) = item_id_for_state_id(state_id) else {
+        return Ok(());
+    };
+
+    let mut online = ONLINE_PLAYERS.lock().await;
+    let Some(player) = online.iter_mut().find(|player| player.uuid == uuid) else {
+        return Ok(());
+    };
+    if player.game_mode != GameMode::Creative {
+        return Ok(());
+    }
+
+    if let Some(hotbar_slot) = hotbar_slot_with_item(player, item_id) {
+        let held_slot = (hotbar_slot - PLAYER_HOTBAR_SLOT_START) as i16;
+        player.held_slot = held_slot;
+        let sender = player.sender.clone();
+        drop(online);
+
+        let _ = sender.send(set_held_slot_packet(held_slot));
+        return Ok(());
+    }
+
+    let slot = PLAYER_HOTBAR_SLOT_START + player.held_slot as usize;
+    let item = PersistedInventoryItem {
+        item_id,
+        count: 1,
+        encoded: Vec::new(),
+    };
+    if let Some(saved_slot) = player.inventory_slots.get_mut(slot) {
+        *saved_slot = Some(item.clone());
+    }
+    let sender = player.sender.clone();
+    drop(online);
+
+    let _ = sender.send(container_set_slot_packet(slot as i16, Some(&item)));
+    Ok(())
+}
+
+pub(super) async fn break_world_block(
+    uuid: [u8; 16],
+    pos: (i32, i32, i32),
+    instant: bool,
+) -> Result<()> {
+    let game_mode = ONLINE_PLAYERS
+        .lock()
+        .await
+        .iter()
+        .find(|player| player.uuid == uuid)
+        .map(|player| player.game_mode);
+    let can_break = match game_mode {
+        // Creative breaks on start; survival waits until the client finishes mining.
+        Some(GameMode::Creative) => instant,
+        Some(mode) => !instant && mode.allows_building(),
+        None => false,
+    };
+    if can_break {
+        set_world_block(pos, 0).await?;
+    }
+    Ok(())
+}
+
+fn hotbar_slot_with_item(player: &OnlinePlayer, item_id: i32) -> Option<usize> {
+    (PLAYER_HOTBAR_SLOT_START..PLAYER_HOTBAR_SLOT_START + 9).find(|&slot| {
+        player
+            .inventory_slots
+            .get(slot)
+            .and_then(|item| item.as_ref())
+            .is_some_and(|item| item.item_id == item_id)
+    })
 }
 
 pub(super) async fn interact_with_block(uuid: [u8; 16], pos: (i32, i32, i32)) -> Result<bool> {
@@ -236,6 +430,26 @@ pub(super) async fn interact_with_block(uuid: [u8; 16], pos: (i32, i32, i32)) ->
     }
 
     Ok(false)
+}
+
+async fn block_state_at(pos: (i32, i32, i32)) -> i32 {
+    WORLD_BLOCKS
+        .lock()
+        .await
+        .get(&pos)
+        .copied()
+        .unwrap_or_else(|| generated_block_state_at(pos))
+}
+
+fn item_id_for_state_id(state_id: i32) -> Option<i32> {
+    BLOCK_ITEM_PLACEMENTS
+        .iter()
+        .find(|(_, placement)| {
+            placement.lower_state_id == state_id
+                || placement.upper_state_id == state_id
+                || double_slab_state_for(placement.block_name) == Some(state_id)
+        })
+        .map(|(&item_id, _)| item_id)
 }
 
 const TOGGLE_RULES: &[(i32, i32, i32)] = &[
@@ -516,6 +730,9 @@ pub(super) async fn place_hand_block(
     else {
         return Ok(());
     };
+    if !player.game_mode.allows_building() {
+        return Ok(());
+    }
     // Use-item-on sends 0 for main hand and 1 for offhand.
     let inventory_slot = match hand {
         0 => PLAYER_HOTBAR_SLOT_START + player.held_slot as usize,
@@ -526,6 +743,7 @@ pub(super) async fn place_hand_block(
         .inventory_slots
         .get(inventory_slot)
         .and_then(|item| item.as_ref())
+        .filter(|item| item.count > 0)
         .map(|item| item.item_id);
     let yaw = player.y_rot;
     let Some(item_id) = held_item else {
@@ -540,6 +758,7 @@ pub(super) async fn place_hand_block(
     {
         // Placing the same slab into an occupied slab block upgrades it to a double slab.
         set_world_block(pos, double_state).await?;
+        consume_placed_item(uuid, inventory_slot, player.game_mode).await?;
         return Ok(());
     }
 
@@ -570,6 +789,35 @@ pub(super) async fn place_hand_block(
             }
         }
     }
+    consume_placed_item(uuid, inventory_slot, player.game_mode).await?;
+    Ok(())
+}
+
+async fn consume_placed_item(uuid: [u8; 16], slot: usize, game_mode: GameMode) -> Result<()> {
+    if game_mode == GameMode::Creative {
+        return Ok(());
+    }
+
+    let mut online = ONLINE_PLAYERS.lock().await;
+    let Some(player) = online.iter_mut().find(|player| player.uuid == uuid) else {
+        return Ok(());
+    };
+    let Some(saved_slot) = player.inventory_slots.get_mut(slot) else {
+        return Ok(());
+    };
+
+    if let Some(item) = saved_slot {
+        item.count -= 1;
+        item.encoded.clear();
+        if item.count <= 0 {
+            *saved_slot = None;
+        }
+    }
+    let sender = player.sender.clone();
+    let slot_after = saved_slot.clone();
+    drop(online);
+
+    let _ = sender.send(container_set_slot_packet(slot as i16, slot_after.as_ref()));
     Ok(())
 }
 

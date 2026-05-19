@@ -1,6 +1,7 @@
 use super::packets::{
-    chunk_batch_finished_packet, chunk_batch_start_packet, chunk_cache_center_packet,
-    container_set_slot_packet, set_held_slot_packet,
+    available_commands_packet, chunk_batch_finished_packet, chunk_batch_start_packet,
+    chunk_cache_center_packet, container_set_slot_packet, player_abilities_packet,
+    player_position_packet, set_held_slot_packet,
 };
 use crate::constants::*;
 use crate::protocol::{pack_position, write_packet, write_string, write_var_i32};
@@ -20,7 +21,9 @@ pub(super) async fn enter_world(
     // Send the absolute spawn position before the heavy chunk batch so the
     // client does not spend its first seconds at the void floor waiting for
     // terrain packets to finish.
-    send_play_login(stream, entity_id).await?;
+    send_play_login(stream, entity_id, player.game_mode).await?;
+    write_packet(stream, &player_abilities_packet(player.game_mode)).await?;
+    write_packet(stream, &available_commands_packet()).await?;
     send_level_chunks_load_start(stream).await?;
     send_chunk_cache_center(stream, chunk_x, chunk_z).await?;
     send_chunk_cache_radius(stream, VIEW_DISTANCE).await?;
@@ -30,7 +33,11 @@ pub(super) async fn enter_world(
     send_superflat_chunks(stream, chunk_x, chunk_z).await
 }
 
-async fn send_play_login(stream: &mut TcpStream, entity_id: i32) -> Result<()> {
+async fn send_play_login(
+    stream: &mut TcpStream,
+    entity_id: i32,
+    game_mode: crate::types::GameMode,
+) -> Result<()> {
     let mut packet = Vec::new();
     write_var_i32(&mut packet, PLAY_LOGIN_PACKET_ID);
     packet.extend_from_slice(&entity_id.to_be_bytes());
@@ -46,7 +53,7 @@ async fn send_play_login(stream: &mut TcpStream, entity_id: i32) -> Result<()> {
     write_var_i32(&mut packet, 0);
     write_string(&mut packet, DIMENSION)?;
     packet.extend_from_slice(&0i64.to_be_bytes());
-    packet.push(1);
+    packet.push(game_mode.id() as u8);
     packet.push(255);
     packet.push(0);
     packet.push(1);
@@ -87,19 +94,11 @@ async fn send_default_spawn(stream: &mut TcpStream) -> Result<()> {
 }
 
 async fn send_player_position(stream: &mut TcpStream, player: &PersistedPlayerData) -> Result<()> {
-    let mut packet = Vec::new();
-    write_var_i32(&mut packet, PLAY_PLAYER_POSITION_PACKET_ID);
-    write_var_i32(&mut packet, 1);
-    packet.extend_from_slice(&player.x.to_be_bytes());
-    packet.extend_from_slice(&player.y.to_be_bytes());
-    packet.extend_from_slice(&player.z.to_be_bytes());
-    packet.extend_from_slice(&0.0f64.to_be_bytes());
-    packet.extend_from_slice(&0.0f64.to_be_bytes());
-    packet.extend_from_slice(&0.0f64.to_be_bytes());
-    packet.extend_from_slice(&player.y_rot.to_be_bytes());
-    packet.extend_from_slice(&player.x_rot.to_be_bytes());
-    packet.extend_from_slice(&0i32.to_be_bytes());
-    write_packet(stream, &packet).await
+    write_packet(
+        stream,
+        &player_position_packet(player.x, player.y, player.z, player.y_rot, player.x_rot),
+    )
+    .await
 }
 
 async fn send_player_inventory(stream: &mut TcpStream, player: &PersistedPlayerData) -> Result<()> {
@@ -152,6 +151,28 @@ pub(super) async fn flat_chunk_packet(x: i32, z: i32) -> Vec<u8> {
     packet
 }
 
+pub(super) fn generated_block_state_at((x, y, z): (i32, i32, i32)) -> i32 {
+    if y == 60 {
+        return BLOCK_STATE_BEDROCK;
+    }
+    if (61..=63).contains(&y) {
+        return BLOCK_STATE_DIRT;
+    }
+    if y == 64 {
+        return BLOCK_STATE_GRASS_BLOCK;
+    }
+    if x == 4 && z == 4 && (65..=68).contains(&y) {
+        return BLOCK_STATE_OAK_LOG;
+    }
+    if (2..=6).contains(&x) && (2..=6).contains(&z) && (67..=69).contains(&y) {
+        return BLOCK_STATE_OAK_LEAVES;
+    }
+    if (3..=5).contains(&x) && (3..=5).contains(&z) && y == 70 {
+        return BLOCK_STATE_OAK_LEAVES;
+    }
+    0
+}
+
 async fn flat_chunk_data(chunk_x: i32, chunk_z: i32) -> Vec<u8> {
     let mut data = Vec::new();
     let world_blocks = WORLD_BLOCKS.lock().await;
@@ -160,52 +181,7 @@ async fn flat_chunk_data(chunk_x: i32, chunk_z: i32) -> Vec<u8> {
     for section_y in -4..20 {
         let mut values = [0i32; 4096];
 
-        if section_y == 3 {
-            // Base terrain sits just below spawn: air, bedrock, then dirt.
-            for dy in 0..16 {
-                let state = if dy < 12 {
-                    0
-                } else if dy == 12 {
-                    BLOCK_STATE_BEDROCK
-                } else {
-                    BLOCK_STATE_DIRT
-                };
-                for dz in 0..16 {
-                    for dx in 0..16 {
-                        values[(dy * 16 + dz) * 16 + dx] = state;
-                    }
-                }
-            }
-        } else if section_y == 4 {
-            for dz in 0..16 {
-                for dx in 0..16 {
-                    values[dz * 16 + dx] = BLOCK_STATE_GRASS_BLOCK;
-                }
-            }
-            if chunk_x == 0 && chunk_z == 0 {
-                // A small tree at spawn makes fresh chunks visibly non-empty.
-                for dy in 1..=4 {
-                    values[(dy * 16 + 4) * 16 + 4] = BLOCK_STATE_OAK_LOG;
-                }
-                for dy in 3..=5 {
-                    for dz in 2..=6 {
-                        for dx in 2..=6 {
-                            if dx == 4 && dz == 4 && dy <= 4 {
-                                continue;
-                            }
-                            values[(dy * 16 + dz) * 16 + dx] = BLOCK_STATE_OAK_LEAVES;
-                        }
-                    }
-                }
-                for dx in 3..=5 {
-                    for dz in 3..=5 {
-                        values[(6 * 16 + dz) * 16 + dx] = BLOCK_STATE_OAK_LEAVES;
-                    }
-                }
-            }
-        }
-
-        // Player edits override generated terrain inside this chunk section.
+        // Generated terrain comes first; player edits override it below.
         let base_y = section_y * 16;
         let base_x = chunk_x * 16;
         let base_z = chunk_z * 16;
@@ -216,6 +192,8 @@ async fn flat_chunk_data(chunk_x: i32, chunk_z: i32) -> Vec<u8> {
                 let global_z = base_z + dz;
                 for dx in 0..16 {
                     let global_x = base_x + dx;
+                    values[(dy as usize * 16 + dz as usize) * 16 + dx as usize] =
+                        generated_block_state_at((global_x, global_y, global_z));
                     if let Some(&state_id) = world_blocks.get(&(global_x, global_y, global_z)) {
                         values[(dy as usize * 16 + dz as usize) * 16 + dx as usize] = state_id;
                     }

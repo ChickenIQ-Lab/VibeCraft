@@ -1,3 +1,4 @@
+mod commands;
 mod configuration;
 mod login;
 mod packets;

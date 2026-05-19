@@ -69,6 +69,7 @@ pub(super) async fn handle_login(mut stream: TcpStream, config: Config) -> Resul
         loaded_chunks: initial_chunk_set(chunk_x, chunk_z),
         held_slot: saved_player.held_slot,
         inventory_slots: saved_player.inventory_slots,
+        game_mode: saved_player.game_mode,
     };
     register_player(&player).await?;
 

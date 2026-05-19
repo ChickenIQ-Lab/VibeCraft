@@ -1,7 +1,7 @@
 use crate::constants::*;
 use crate::protocol::{pack_position, write_string, write_var_i32};
-use crate::types::{OnlinePlayer, PersistedInventoryItem, ProfileProperty};
-use anyhow::Result;
+use crate::types::{GameMode, OnlinePlayer, PersistedInventoryItem, ProfileProperty};
+use anyhow::{Result, ensure};
 
 pub(super) fn write_profile_properties(
     out: &mut Vec<u8>,
@@ -56,7 +56,7 @@ pub(super) fn player_info_update_packet(players: &[OnlinePlayer]) -> Result<Vec<
         write_string(&mut packet, &player.username)?;
         write_profile_properties(&mut packet, &player.profile_properties)?;
         packet.push(0);
-        write_var_i32(&mut packet, 1);
+        write_var_i32(&mut packet, player.game_mode.id());
         packet.push(1);
         write_var_i32(&mut packet, 0);
         packet.push(0);
@@ -64,6 +64,16 @@ pub(super) fn player_info_update_packet(players: &[OnlinePlayer]) -> Result<Vec<
         packet.push(1);
     }
     Ok(packet)
+}
+
+pub(super) fn player_game_mode_update_packet(uuid: [u8; 16], game_mode: GameMode) -> Vec<u8> {
+    let mut packet = Vec::new();
+    write_var_i32(&mut packet, PLAY_PLAYER_INFO_UPDATE_PACKET_ID);
+    packet.push(0x04);
+    write_var_i32(&mut packet, 1);
+    packet.extend_from_slice(&uuid);
+    write_var_i32(&mut packet, game_mode.id());
+    packet
 }
 
 pub(super) fn add_player_entity_packet(player: &OnlinePlayer) -> Vec<u8> {
@@ -109,6 +119,117 @@ pub(super) fn set_held_slot_packet(slot: i16) -> Vec<u8> {
     write_var_i32(&mut packet, PLAY_SET_HELD_SLOT_PACKET_ID);
     write_var_i32(&mut packet, slot as i32);
     packet
+}
+
+pub(super) fn game_event_packet(event: u8, value: f32) -> Vec<u8> {
+    let mut packet = Vec::new();
+    write_var_i32(&mut packet, PLAY_GAME_EVENT_PACKET_ID);
+    packet.push(event);
+    packet.extend_from_slice(&value.to_be_bytes());
+    packet
+}
+
+pub(super) fn player_abilities_packet(game_mode: GameMode) -> Vec<u8> {
+    let mut packet = Vec::new();
+    write_var_i32(&mut packet, PLAY_PLAYER_ABILITIES_PACKET_ID);
+    packet.push(game_mode.ability_flags());
+    packet.extend_from_slice(&0.05f32.to_be_bytes());
+    packet.extend_from_slice(&0.1f32.to_be_bytes());
+    packet
+}
+
+pub(super) fn player_position_packet(x: f64, y: f64, z: f64, y_rot: f32, x_rot: f32) -> Vec<u8> {
+    let mut packet = Vec::new();
+    write_var_i32(&mut packet, PLAY_PLAYER_POSITION_PACKET_ID);
+    write_var_i32(&mut packet, 1);
+    packet.extend_from_slice(&x.to_be_bytes());
+    packet.extend_from_slice(&y.to_be_bytes());
+    packet.extend_from_slice(&z.to_be_bytes());
+    packet.extend_from_slice(&0.0f64.to_be_bytes());
+    packet.extend_from_slice(&0.0f64.to_be_bytes());
+    packet.extend_from_slice(&0.0f64.to_be_bytes());
+    packet.extend_from_slice(&y_rot.to_be_bytes());
+    packet.extend_from_slice(&x_rot.to_be_bytes());
+    packet.extend_from_slice(&0i32.to_be_bytes());
+    packet
+}
+
+pub(super) fn available_commands_packet() -> Vec<u8> {
+    let mut packet = Vec::new();
+    write_var_i32(&mut packet, PLAY_COMMANDS_PACKET_ID);
+
+    let command_nodes = [
+        CommandNode::root(&[1, 2]),
+        CommandNode::literal("reset", true, &[]),
+        CommandNode::literal("gamemode", false, &[3, 4, 5, 6]),
+        CommandNode::literal("survival", true, &[]),
+        CommandNode::literal("creative", true, &[]),
+        CommandNode::literal("adventure", true, &[]),
+        CommandNode::literal("spectator", true, &[]),
+    ];
+    write_var_i32(&mut packet, command_nodes.len() as i32);
+    for node in command_nodes {
+        node.write(&mut packet);
+    }
+    write_var_i32(&mut packet, 0);
+    packet
+}
+
+pub(super) fn system_chat_packet(message: &str) -> Result<Vec<u8>> {
+    let mut packet = Vec::new();
+    write_var_i32(&mut packet, PLAY_SYSTEM_CHAT_PACKET_ID);
+    write_nbt_string(&mut packet, message)?;
+    packet.push(0);
+    Ok(packet)
+}
+
+struct CommandNode<'a> {
+    name: Option<&'a str>,
+    executable: bool,
+    children: &'a [i32],
+}
+
+impl<'a> CommandNode<'a> {
+    fn root(children: &'a [i32]) -> Self {
+        Self {
+            name: None,
+            executable: false,
+            children,
+        }
+    }
+
+    fn literal(name: &'a str, executable: bool, children: &'a [i32]) -> Self {
+        Self {
+            name: Some(name),
+            executable,
+            children,
+        }
+    }
+
+    fn write(self, packet: &mut Vec<u8>) {
+        let mut flags = if self.name.is_some() { 0x01 } else { 0x00 };
+        if self.executable {
+            flags |= 0x04;
+        }
+        packet.push(flags);
+        write_var_i32(packet, self.children.len() as i32);
+        for child in self.children {
+            write_var_i32(packet, *child);
+        }
+        if let Some(name) = self.name {
+            write_string(packet, name).expect("command literals are short ASCII strings");
+        }
+    }
+}
+
+fn write_nbt_string(packet: &mut Vec<u8>, value: &str) -> Result<()> {
+    let bytes = value.as_bytes();
+    ensure!(bytes.len() <= u16::MAX as usize, "chat message is too long");
+    // Components can be encoded as a literal NBT string tag in this protocol.
+    packet.push(8);
+    packet.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    packet.extend_from_slice(bytes);
+    Ok(())
 }
 
 fn write_optional_item_stack(packet: &mut Vec<u8>, item: Option<&PersistedInventoryItem>) {
