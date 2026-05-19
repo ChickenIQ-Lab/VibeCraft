@@ -9,6 +9,7 @@ This repository is a Rust Minecraft server project.
 - Run formatting and checks before committing code changes.
 - Restart the VibeCraft server after every code or configuration change with `./restart-server.sh`.
 - Keep changes small and practical.
+- Prefer splitting new code into multiple focused files or modules by default when one file would mix responsibilities or become large.
 - Code should always include comments.
 - Decompiled Minecraft sources are stored in `decompiled/` and gitignored.
 
