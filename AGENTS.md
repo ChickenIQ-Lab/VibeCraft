@@ -22,8 +22,8 @@ This repository is a Rust Minecraft server project.
 
 - Default bind address: `0.0.0.0:25565`.
 - Use `./restart-server.sh` to stop any existing server process and start a fresh one.
-- Server logs are written to `/tmp/vibecraft-server.log` when started by the agent.
-- Server PID is written to `/tmp/vibecraft-server.pid` when started by the agent.
+- Server logs are written to `data/logs/vibecraft-server.log` when started by the agent.
+- Server PID is written to `data/run/vibecraft-server.pid` when started by the agent.
 
 ## Output Style
 

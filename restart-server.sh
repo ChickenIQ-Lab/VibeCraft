@@ -3,25 +3,20 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PID_FILE="/tmp/vibecraft-server.pid"
-LOG_FILE="/tmp/vibecraft-server.log"
+RUN_DIR="$ROOT_DIR/data/run"
+LOG_DIR="$ROOT_DIR/data/logs"
+PID_FILE="$RUN_DIR/vibecraft-server.pid"
+LOG_FILE="$LOG_DIR/vibecraft-server.log"
 BINARY="$ROOT_DIR/target/debug/vibecraft"
 
-stop_existing_server() {
-  if [[ ! -f "$PID_FILE" ]]; then
-    return
-  fi
-
-  local pid
-  pid="$(<"$PID_FILE")"
+stop_pid() {
+  local pid="$1"
 
   if [[ -z "$pid" ]]; then
-    rm -f "$PID_FILE"
     return
   fi
 
   if ! kill -0 "$pid" 2>/dev/null; then
-    rm -f "$PID_FILE"
     return
   fi
 
@@ -29,7 +24,6 @@ stop_existing_server() {
 
   for _ in $(seq 1 50); do
     if ! kill -0 "$pid" 2>/dev/null; then
-      rm -f "$PID_FILE"
       return
     fi
 
@@ -37,9 +31,16 @@ stop_existing_server() {
   done
 
   kill -9 "$pid" 2>/dev/null || true
-  rm -f "$PID_FILE"
 }
 
+stop_existing_server() {
+  if [[ -f "$PID_FILE" ]]; then
+    stop_pid "$(<"$PID_FILE")"
+    rm -f "$PID_FILE"
+  fi
+}
+
+mkdir -p "$RUN_DIR" "$LOG_DIR"
 stop_existing_server
 
 cargo build --quiet --manifest-path "$ROOT_DIR/Cargo.toml"

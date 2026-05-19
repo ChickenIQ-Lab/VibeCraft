@@ -5,7 +5,7 @@ use super::packets::{
     player_info_update_packet, remove_entities_packet, rotate_head_packet,
 };
 use super::profile::uuid_without_dashes;
-use super::storage::save_player_data;
+use super::storage::{save_player_data, save_world_blocks};
 use super::world::flat_chunk_packet;
 use crate::constants::*;
 use crate::types::{
@@ -586,6 +586,7 @@ pub(super) async fn set_world_block(pos: (i32, i32, i32), block_state_id: i32) -
     let mut world = WORLD_BLOCKS.lock().await;
     world.insert(pos, block_state_id);
     drop(world);
+    save_world_blocks().await?;
 
     // Store the edit once, then fan the same block update packet to every client.
     let packet = block_update_packet(pos, block_state_id);

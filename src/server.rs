@@ -13,9 +13,33 @@ use crate::protocol::read_packet;
 use crate::types::Config;
 use anyhow::{Result, bail};
 use tokio::net::TcpStream;
-use tracing::debug;
+use tokio::time::{Duration, interval};
+use tracing::{debug, warn};
 
 pub(crate) use state::load_block_item_placements;
+
+pub(crate) async fn load_persistent_state() -> Result<usize> {
+    storage::load_world_blocks().await
+}
+
+pub(crate) async fn save_persistent_state() -> Result<()> {
+    storage::save_online_players().await?;
+    storage::save_world_blocks().await
+}
+
+pub(crate) fn spawn_persistence_task() {
+    tokio::spawn(async {
+        let mut autosave = interval(Duration::from_secs(30));
+        autosave.tick().await;
+
+        loop {
+            autosave.tick().await;
+            if let Err(err) = storage::save_online_players().await {
+                warn!(error = %err, "failed to autosave player data");
+            }
+        }
+    });
+}
 
 pub(crate) async fn handle_connection(mut stream: TcpStream, config: Config) -> Result<()> {
     let packet = read_packet(&mut stream).await?;

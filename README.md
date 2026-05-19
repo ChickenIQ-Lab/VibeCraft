@@ -14,13 +14,13 @@ A small Rust Minecraft server foundation for the `26.1` protocol family.
 - Multi-player visibility through player info, entity spawn/despawn, metadata, movement, and head-rotation packets
 - Keep-alive heartbeat while players are connected
 - Creative inventory tracking for selected hotbar slot, slot edits, offhand swaps, and reconnect replay
-- Player persistence for position, rotation, on-ground state, selected slot, and inventory under `data/players/`
-- In-memory block edits with break/place actions, block update broadcasts, same-slab double-slab merging, tall blocks, beds, and basic toggleable block states
+- Binary player persistence for position, rotation, on-ground state, selected slot, and inventory under `data/players/`
+- Binary block edit persistence under `data/world/blocks.bin`, with break/place actions, block update broadcasts, same-slab double-slab merging, tall blocks, beds, and basic toggleable block states
 - Generated block placement table in `src/block_items.csv` with `1026` item-to-block mappings
 
 The default version label is `26.1.2`. The default protocol number is `775`, matching the `26.1` protocol family.
 
-World block edits live in memory only for now. Player data is saved when a player disconnects.
+World block edits save after each edit. Player data saves on disconnect, on clean shutdown, and every 30 seconds while players are online.
 
 ## Run
 
